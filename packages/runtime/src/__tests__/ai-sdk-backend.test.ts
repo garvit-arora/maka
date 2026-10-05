@@ -8643,6 +8643,7 @@ describe('AiSdkBackend usage telemetry', () => {
 
   test('retries an output-free unmetered stop after a settled tool call and recovers', async () => {
     const durable = durableTurnHarness('turn-output-free-stop-retry', 'read the file');
+    const stored: StoredMessage[] = [];
     let calls = 0;
     let toolExecutions = 0;
     const model = new MockLanguageModelV4({
@@ -8706,14 +8707,20 @@ describe('AiSdkBackend usage telemetry', () => {
           },
         },
       ],
+      appendMessage: async (message) => {
+        stored.push(message);
+      },
       loadTurnRuntimeEvents: durable.loadTurnRuntimeEvents,
       providerRetrySleep: async () => {},
     });
 
-    const events = await drainDurably(backend.send(durable.input()), durable);
+    // Two logical steps: the tool step and the answer step. The failed
+    // physical request must not spend the answer step's budget.
+    const events = await drainDurably(backend.send(durable.input({ maxSteps: 2 })), durable);
 
     assert.equal(calls, 3);
     assert.equal(toolExecutions, 1);
+    assert.equal(events.filter((event) => event.type === 'tool_result').length, 1);
     assert.deepEqual(
       events
         .filter((event) => event.type === 'provider_retry')
@@ -8730,6 +8737,29 @@ describe('AiSdkBackend usage telemetry', () => {
     );
     assert.equal(
       events.some((event) => event.type === 'error'),
+      false,
+    );
+    // The output-free attempt leaves no empty or interrupted assistant row.
+    assert.deepEqual(
+      events
+        .filter((event) => event.type === 'text_complete')
+        .map((event) => ({ text: event.text, interrupted: event.interrupted })),
+      [{ text: 'Recovered answer', interrupted: undefined }],
+    );
+    assert.deepEqual(
+      stored
+        .filter((message): message is AssistantMessage => message.type === 'assistant')
+        .map(({ text, interrupted }) => ({ text, interrupted })),
+      [{ text: 'Recovered answer', interrupted: undefined }],
+    );
+    // The failed request reported no usage, so the send-level record fails
+    // closed instead of presenting the metered steps as the whole cost (#972).
+    assert.equal(
+      events.some((event) => event.type === 'token_usage'),
+      false,
+    );
+    assert.equal(
+      stored.some((message) => message.type === 'token_usage'),
       false,
     );
     assert.equal(events.find((event) => event.type === 'complete')?.stopReason, 'end_turn');
@@ -9660,28 +9690,29 @@ describe('AiSdkBackend usage telemetry', () => {
 
   test('does not record fabricated zero telemetry when provider usage is unavailable', async () => {
     const events: SessionEvent[] = [];
+    let calls = 0;
+    // A valid answer whose provider omitted usage. The text keeps this on the
+    // successful-response path; an output-free stop would be retried instead.
     const model = new MockLanguageModelV4({
-      doStream: {
-        stream: simulateReadableStream({
-          chunks: [
-            { type: 'stream-start', warnings: [] },
-            {
-              type: 'finish',
-              finishReason: { unified: 'stop', raw: 'stop' },
-              usage: {
-                inputTokens: {
-                  total: undefined,
-                  noCache: undefined,
-                  cacheRead: undefined,
-                  cacheWrite: undefined,
-                },
-                outputTokens: { total: undefined, text: undefined, reasoning: undefined },
-              } as never,
-            },
-          ],
-          initialDelayInMs: null,
-          chunkDelayInMs: null,
-        }),
+      doStream: async () => {
+        calls += 1;
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: 'stream-start', warnings: [] },
+              { type: 'text-start', id: 'text-1' },
+              { type: 'text-delta', id: 'text-1', delta: 'Hello' },
+              { type: 'text-end', id: 'text-1' },
+              {
+                type: 'finish',
+                finishReason: { unified: 'stop', raw: 'stop' },
+                usage: unavailableUsage(),
+              },
+            ] as LanguageModelV4StreamPart[],
+            initialDelayInMs: null,
+            chunkDelayInMs: null,
+          }),
+        };
       },
     });
     const backend = createBackend({
@@ -9689,12 +9720,20 @@ describe('AiSdkBackend usage telemetry', () => {
       modelId: 'mock-model-id',
       modelFactory: () => model,
       tools: [],
+      providerRetrySleep: async () => {},
     });
 
     for await (const event of backend.send({ turnId: 'turn-1', text: 'hi', context: [] })) {
       events.push(event);
     }
 
+    assert.equal(calls, 1);
+    assert.equal(
+      events.some((event) => event.type === 'provider_retry' || event.type === 'error'),
+      false,
+    );
+    assert.equal(events.find((event) => event.type === 'text_complete')?.text, 'Hello');
+    assert.equal(events.find((event) => event.type === 'complete')?.stopReason, 'end_turn');
     // No usable sample means no usage record at all — a zero would be
     // indistinguishable from a call that genuinely consumed nothing (#972).
     assert.deepEqual(
