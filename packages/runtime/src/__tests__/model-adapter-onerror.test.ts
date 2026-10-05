@@ -483,6 +483,25 @@ describe('ModelAdapter.startStream onError', () => {
     assert.equal(outcome.failure.retryable, true);
   });
 
+  test('completes a text stop with unavailable usage without fabricating usage', async () => {
+    const outcome = await settle([
+      { type: 'stream-start', warnings: [] },
+      { type: 'text-start', id: 'text-1' },
+      { type: 'text-delta', id: 'text-1', delta: 'answer' },
+      { type: 'text-end', id: 'text-1' },
+      {
+        type: 'finish',
+        finishReason: { unified: 'stop', raw: 'stop' },
+        usage: UNAVAILABLE_USAGE,
+      },
+    ]);
+
+    assert.equal(outcome.kind, 'completed');
+    if (outcome.kind !== 'completed') return;
+    assert.equal(outcome.finishReason, 'stop');
+    assert.equal(outcome.usage, undefined);
+  });
+
   for (const providerExecuted of [false, true]) {
     test(`rejects an output-free stop after only a tool-input marker (providerExecuted=${providerExecuted})`, async () => {
       const outcome = await settle([
